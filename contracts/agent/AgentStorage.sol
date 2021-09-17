@@ -11,17 +11,17 @@ contract AgentStorage {
     // sc address for dual farming
     address public wanswapFarming;
     // the reward token for dual farming
-    address public zoo;       
+    address public zoo;
     // the reward token for dual farming
-    address public wasp;       
+    address public wasp;
     // Dev address.
     address public devaddr;
     // boosting controller contract address
     address public boostingAddr;
+    // help contract address
+    address public helpAddr;
     // Max multiplier
     uint256 public devZoo;
-    // ZOO tokens created per block.
-    uint256 public zooPerBlock;
 
     // Info of each pool.
     struct AgentPool {
@@ -34,21 +34,16 @@ contract AgentStorage {
         // uint256 waspPid;         // PID for extra pool
         uint256 accWaspPerShare; // Accumulated extra token per share, times 1e12.
 
-        IERC20 lpToken;          // Address of LP token contract.
+        uint256 nftTokenId;         // token id of pool nft.
         address nftOwner;         // Address of nft token user.
+        IERC20 lpToken;          // Address of LP token contract.
 
         bool dualFarmingEnable;
         bool emergencyMode;
         bool disable;
     }
-    // // Info of each pool.
-    // AgentPool[] public agentPool;
 
-    AgentPool[] public agentPool;
-    // pid+1 => index+1
-    mapping (uint256 => uint256) public incPid2IncAgentIndex;
-    // index+1 => pid+1
-    mapping (uint256 => uint256) public incAgentIndex2IncPid;
+    mapping(uint256 => AgentPool) public agentPool;
 
     // Info of each user.
     struct UserInfo {
@@ -72,5 +67,8 @@ contract AgentStorage {
 
     // Total allocation poitns. Must be the sum of all allocation points in all pools.
 
-    uint256 public constant TEAM_PERCENT = 10; 
+    uint256 public constant TEAM_PERCENT = 25;
+    uint256 public constant NFT_PERCENT = 25;
+    uint256 public constant LP_PERCENT = 50;
+    uint256 public constant DENOMINATOR = 100;
 }

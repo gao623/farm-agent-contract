@@ -12,6 +12,7 @@ import "../interface/IZooKeeperFarming.sol";
 import "../interface/IWaspFarming.sol";
 import "../interface/IBoosting.sol";
 import "../interface/IZooNFT.sol";
+import "../interface/IHelp.sol";
 import "./AgentStorage.sol";
 
 contract AgentMiner is Ownable, ERC721Holder, AgentStorage {
@@ -21,236 +22,236 @@ contract AgentMiner is Ownable, ERC721Holder, AgentStorage {
     event LoadPool(address indexed farm, uint256 indexed zooPid);
     event Deposit(address indexed user, uint256 indexed pid, uint256 amount, uint256 nftTokenId);
     event Withdraw(address indexed user, uint256 indexed pid, uint256 amount, uint256 zooReward, uint256 devReward, uint256 waspReward);
-    event EmergencyWithdraw(address indexed user, uint256 indexed pid, uint256 amount);
+    event EmergencyWithdraw(address indexed user, uint256 indexed pid, uint256 amount, uint256 zooReward, uint256 devReward, uint256 waspReward);
 
-    // TODO: Debug EVENT
-    // event TokenBalanceDebug(address indexed token, address indexed owner, uint256 balance);
+    modifier onlyValidPool(uint256 _pid) {
+        require(_pid < poolLength(), "invalid pid");
+        _;
+    }
 
     constructor(
         address _zooKeeprFarming,
-        address _devaddr
+        address _devaddr,
+        address _helpAddr
     ) public {
         zooKeeperFarming = _zooKeeprFarming;
         devaddr = _devaddr;
+        helpAddr = _helpAddr;
         wanswapFarming = IZooKeeperFarming(_zooKeeprFarming).wanswapFarming();
         boostingAddr = IZooKeeperFarming(_zooKeeprFarming).boostingAddr();
         zoo = IZooKeeperFarming(_zooKeeprFarming).zoo();
         wasp = IZooKeeperFarming(_zooKeeprFarming).wasp();
-        zooPerBlock = IZooKeeperFarming(_zooKeeprFarming).zooPerBlock();
+    }
+
+    // Load a ZooKeeper pool. Can be called by everybody.
+    function add(uint256 _pid) external onlyValidPool(_pid) {
+        AgentPool storage agent = agentPool[_pid];
+        if (address(agent.lpToken) == address(0)) {
+            loadPool(_pid);
+        }
     }
 
     // Deposit LP tokens to ZooKeeperFarming for ZOO allocation.
     function deposit(uint256 _pid, uint256 _amount, uint256 _nftTokenId) external {
-        // require (IZooKeeperFarming(zooKeeperFarming).poolLength() > _pid, "invalid agent");
         updatePool(_pid);
 
-        AgentPool storage agent = agentPool[getAgentIndex(_pid)];
-        // AgentPool storage agent = agentPool[_pid];
-
+        AgentPool storage agent = agentPool[_pid];
         if (_amount != 0) {
             agent.lpToken.safeTransferFrom(msg.sender, address(this), _amount);
         }
 
-        // update nft token or not
-        uint256 oldNftTokenId;
-        // address boostingAddr = zooBoostingAddress();
-        bool needUpdatePoolNft;
-        if (_nftTokenId != 0) {
-            (oldNftTokenId, needUpdatePoolNft) = canReplacePoolNFT(_pid, _nftTokenId, boostingAddr);
-            require(needUpdatePoolNft, "nft too slow");
-        }
-
+        address poolNftOwner = agent.nftOwner;
+        uint256 poolNftTokenId = agent.nftTokenId;
         uint256 lpSupply = zooPoolSupply(_pid);
-        address zooTokenAddr = zoo;
-        needUpdatePoolNft = needUpdatePoolNft && (lpSupply.add(_amount) != 0);
-        if (needUpdatePoolNft) {
+        bool canReplacePoolNft = canReplaceNFT(_nftTokenId, poolNftTokenId, boostingAddr);
+        canReplacePoolNft = canReplacePoolNft && (lpSupply.add(_amount) != 0);
+
+        if (canReplacePoolNft) {
             // return old nft, and transfer nft reward
             IZooKeeperFarming(zooKeeperFarming).withdraw(_pid, lpSupply);
 
-            address oldNftOwner = agent.nftOwner;
-            agent.nftOwner = msg.sender;
+            // update nftOwner and nftTokenId
+            updateNftTokenIdAndOwner(_pid, _nftTokenId, msg.sender);
 
+            // new nft trasfer from new nftOwner
             IERC721 nftToken = IERC721(getNftAddress(boostingAddr));
-            // IERC721 nftToken = IERC721(IBoosting(boostingAddr).NFTAddress());
+            nftToken.safeTransferFrom(msg.sender, address(this), _nftTokenId);
             if (!nftToken.isApprovedForAll(address(this), boostingAddr)) {
                 nftToken.setApprovalForAll(boostingAddr, true);
             }
 
-            nftToken.safeTransferFrom(msg.sender, address(this), _nftTokenId);
-            if (oldNftTokenId != 0) {
-                // if (!nftToken.isApprovedForAll(address(this), oldNftOwner)) {
-                //     nftToken.setApprovalForAll(oldNftOwner, true);
-                // }
-                nftToken.safeTransferFrom(address(this), oldNftOwner, oldNftTokenId);
+            // return old nft to old nftOwner
+            if (poolNftOwner != address(0) && IHelp(helpAddr).isValidNftTokenId(poolNftTokenId)) {
+                nftToken.safeTransferFrom(address(this), poolNftOwner, poolNftTokenId);
             }
-
-            uint256 oldZooNftReward = agent.nftUserZooReward;
-            agent.nftUserZooReward = 0;
-            safeERC20TokenTransfer(zooTokenAddr, oldNftOwner, oldZooNftReward);
         } else {
+            // withdraw reward
             IZooKeeperFarming(zooKeeperFarming).withdraw(_pid, 0);
         }
 
-        if (devZoo != 0) {
-            uint256 pendDevZoo = devZoo;
+        address zooTokenAddr = zoo;
+        uint256 poolZooNftReward = agent.nftUserZooReward;
+        // transfer nft reward
+        if (poolZooNftReward != 0) {
+            // transfer nft reward to nft owner
+            agent.nftUserZooReward = 0;
+            safeRewardTokenTransfer(zooTokenAddr, poolNftOwner, poolZooNftReward);
+        }
+
+        // transfer dev reward
+        uint256 pendDevZoo = devZoo;
+        if (pendDevZoo != 0) {
             devZoo = 0;
-            safeERC20TokenTransfer(zooTokenAddr, devaddr, pendDevZoo);
+            safeRewardTokenTransfer(zooTokenAddr, devaddr, pendDevZoo);
         }
 
+        // transfer user lp zoo reward
         UserInfo storage user = userInfo[_pid][msg.sender];
-        uint256 userOldAmount = user.amount;
-        if (userOldAmount != 0) {
-            uint256 pending = userOldAmount.mul(agent.accZooPerShare).div(1e12).sub(user.zooRewardDebt);
-            safeERC20TokenTransfer(zooTokenAddr, msg.sender, pending);
+        uint256 userLpAmount = user.amount;
+        if (userLpAmount != 0) {
+            uint256 pending = userLpAmount.mul(agent.accZooPerShare).div(1e12).sub(user.zooRewardDebt);
+            safeRewardTokenTransfer(zooTokenAddr, msg.sender, pending);
         }
 
-        user.amount = userOldAmount.add(_amount);
+        // update user lp amount, zooRewardDebt
+        user.amount = userLpAmount.add(_amount);
         user.zooRewardDebt = user.amount.mul(agent.accZooPerShare).div(1e12);
 
+        // transfer user lp wasp reward,  and update user lp waspRewardDebt
         if (agent.dualFarmingEnable) {
-            uint256 waspPending = userOldAmount.mul(agent.accWaspPerShare).div(1e12).sub(user.waspRewardDebt);
-            safeERC20TokenTransfer(wasp, msg.sender, waspPending);
+            uint256 waspPending = userLpAmount.mul(agent.accWaspPerShare).div(1e12).sub(user.waspRewardDebt);
+            safeRewardTokenTransfer(wasp, msg.sender, waspPending);
             user.waspRewardDebt = user.amount.mul(agent.accWaspPerShare).div(1e12);
         }
 
-        if (needUpdatePoolNft) {
+        // deposit to zoo farming
+        if (canReplacePoolNft) {
             lpSupply = lpSupply.add(_amount);
             agent.lpToken.approve(zooKeeperFarming, lpSupply);
             IZooKeeperFarming(zooKeeperFarming).deposit(_pid, lpSupply, 0, _nftTokenId);
+            emit Deposit(msg.sender, _pid, _amount, _nftTokenId);
         } else {
             agent.lpToken.approve(zooKeeperFarming, _amount);
-            IZooKeeperFarming(zooKeeperFarming).deposit(_pid, _amount, 0, _nftTokenId);
+            IZooKeeperFarming(zooKeeperFarming).deposit(_pid, _amount, 0, IHelp(helpAddr).nilTokenId());
+            emit Deposit(msg.sender, _pid, _amount, 0);
         }
-
-        emit Deposit(msg.sender, _pid, _amount, _nftTokenId);
     }
 
     // Withdraw LP tokens from ZooKeeperFarming.
-    function withdraw(uint256 _pid, uint256 _amount) external {
+    function withdraw(uint256 _pid, uint256 _amount, uint256 _nftWithdraw) external {
         updatePool(_pid);
 
-        AgentPool storage agent = agentPool[getAgentIndex(_pid)];
-        // AgentPool storage agent = agentPool[_pid];
+        AgentPool storage agent = agentPool[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
-        uint256 userOldAmount = user.amount;
-        uint256 pendingZoo = userOldAmount.mul(agent.accZooPerShare).div(1e12).sub(user.zooRewardDebt);
+        uint256 userLpAmount = user.amount;
+        uint256 userPendLpZoo = userLpAmount.mul(agent.accZooPerShare).div(1e12).sub(user.zooRewardDebt);
 
         user.amount = user.amount.sub(_amount);
         user.zooRewardDebt = user.amount.mul(agent.accZooPerShare).div(1e12);
 
-        bool isNftOwner = msg.sender == agent.nftOwner;
-        bool isNftOwnerWithdrawAll = isNftOwner && user.amount == 0;
-        uint256 nftTokenId;
-        if (isNftOwnerWithdrawAll) {
-            nftTokenId = getPoolNftTokenId(_pid, boostingAddr);
-            // nftTokenId = getBoostUserTokenId(boostingAddr, _pid, address(this));
-        }
+        uint256 nftTokenId = agent.nftTokenId;
+        address poolNftOwner = agent.nftOwner;
+        bool isWithdrawNft = (msg.sender == poolNftOwner) && (_nftWithdraw != 0);
 
-        if (user.amount == 0) {
+        // withdraw from zoo farming
+        if (isWithdrawNft) {
             uint256 lpSupply = zooPoolSupply(_pid);
             IZooKeeperFarming(zooKeeperFarming).withdraw(_pid, lpSupply);
-            lpSupply = lpSupply.sub(_amount);
-            agent.lpToken.approve(zooKeeperFarming, lpSupply);
-            IZooKeeperFarming(zooKeeperFarming).deposit(_pid, lpSupply, 0, 0);
+            if (lpSupply != _amount) {
+                lpSupply = lpSupply.sub(_amount);
+                agent.lpToken.approve(zooKeeperFarming, lpSupply);
+                IZooKeeperFarming(zooKeeperFarming).deposit(_pid, lpSupply, 0, IHelp(helpAddr).nilTokenId());
+            }
         } else {
             IZooKeeperFarming(zooKeeperFarming).withdraw(_pid, _amount);
+            // if lp balance is 0 in zoo farming, return nft to the nftOwner
+            isWithdrawNft = (zooPoolSupply(_pid) == 0) && poolNftOwner != address(0);
         }
 
+        // transfer user lp reward
         address zooTokenAddr = zoo;
-        safeERC20TokenTransfer(zooTokenAddr, msg.sender, pendingZoo);
+        safeRewardTokenTransfer(zooTokenAddr, msg.sender, userPendLpZoo);
 
+        // // transfer dev reward
         uint256 pendDevZoo = devZoo;
         if (pendDevZoo != 0) {
             devZoo = 0;
-            safeERC20TokenTransfer(zooTokenAddr, devaddr, pendDevZoo);
+            safeRewardTokenTransfer(zooTokenAddr, devaddr, pendDevZoo);
         }
 
-        uint256 oldZooNftReward = agent.nftUserZooReward;
-        if (isNftOwnerWithdrawAll) {
+        // transfer nft owner reward
+        uint256 poolZooNftReward = agent.nftUserZooReward;
+        if (isWithdrawNft) {
             IERC721 nftToken = IERC721(getNftAddress(boostingAddr));
-            // IERC721 nftToken = IERC721(IBoosting(boostingAddr).NFTAddress());
-            nftToken.safeTransferFrom(address(this), msg.sender, nftTokenId);
+            nftToken.safeTransferFrom(address(this), poolNftOwner, nftTokenId);
 
-            address oldNftOwner = agent.nftOwner;
+            updateNftTokenIdAndOwner(_pid, IHelp(helpAddr).nilTokenId(), address(0));
             agent.nftUserZooReward = 0;
-            agent.nftOwner = address(0);
-            safeERC20TokenTransfer(zooTokenAddr, oldNftOwner, oldZooNftReward);
-        } else if (isNftOwner) {
+            safeRewardTokenTransfer(zooTokenAddr, poolNftOwner, poolZooNftReward);
+        } else if (poolZooNftReward != 0) {
             agent.nftUserZooReward = 0;
-            safeERC20TokenTransfer(zooTokenAddr, agent.nftOwner, oldZooNftReward);
+            safeRewardTokenTransfer(zooTokenAddr, poolNftOwner, poolZooNftReward);
         }
 
+        // transfer user lp wasp reward
         uint256 waspPending;
         if (agent.dualFarmingEnable) {
-            waspPending = userOldAmount.mul(agent.accWaspPerShare).div(1e12).sub(user.waspRewardDebt);
+            waspPending = userLpAmount.mul(agent.accWaspPerShare).div(1e12).sub(user.waspRewardDebt);
             user.waspRewardDebt = user.amount.mul(agent.accWaspPerShare).div(1e12);
-            safeERC20TokenTransfer(wasp, msg.sender, waspPending);
+            safeRewardTokenTransfer(wasp, msg.sender, waspPending);
         }
 
-        if (_amount > 0) {
+        // transfer user token
+        if (_amount != 0) {
             agent.lpToken.safeTransfer(msg.sender, _amount);
         }
-
-        emit Withdraw(msg.sender, _pid, _amount, pendingZoo, pendDevZoo, waspPending);
+        emit Withdraw(msg.sender, _pid, _amount, userPendLpZoo, pendDevZoo, waspPending);
     }
 
-    function removeNFT(uint256 _pid) external {
-        updatePool(_pid);
+    // Try to withdraw nft. EMERGENCY ONLY.
+    function emergencyClaimPoolNFT(uint256 _pid, uint256 _nftTokenId) external onlyOwner {
+        require(zooPoolEmergencyMode(_pid), "emergency only");
 
-        AgentPool storage agent = agentPool[getAgentIndex(_pid)];
-        address oldNftOwner = agent.nftOwner;
-        // AgentPool storage agent = agentPool[_pid];
-        require(oldNftOwner != address(0) && oldNftOwner == msg.sender, "invalid NFT owner");
+        AgentPool storage agent = agentPool[_pid];
+        address poolNftOwner = agent.nftOwner;
+        if (poolNftOwner == address(0)) {
+            return;
+        }
 
-        uint256 lpSupply = zooPoolSupply(_pid);
-        agent.nftOwner = address(0);
-
-        uint256 nftTokenId = getPoolNftTokenId(_pid, boostingAddr);
-        if (lpSupply != 0) {
+        uint256 poolNftTokenId = agent.nftTokenId;
+        if (!IHelp(helpAddr).isValidNftTokenId(_nftTokenId)) {
+            uint256 lpSupply = zooPoolSupply(_pid);
             IZooKeeperFarming(zooKeeperFarming).withdraw(_pid, lpSupply);
-        }
+            // uint256 poolNftTokenId = agent.nftTokenId;
 
-        // return the nft
-        // address boostingAddr = zooBoostingAddress();
-        IERC721 nftToken = IERC721(getNftAddress(boostingAddr));
-        if (nftTokenId != 0) {
-            nftToken.safeTransferFrom(address(this), oldNftOwner, nftTokenId);
-        }
+            IERC721 nftToken = IERC721(getNftAddress(boostingAddr));
+            require(nftToken.ownerOf(poolNftTokenId) == address (this), "withdraw nft failed") ;
+            updateNftTokenIdAndOwner(_pid, IHelp(helpAddr).nilTokenId(), address(0));
+            nftToken.safeTransferFrom(address(this), poolNftOwner, poolNftTokenId);
+        } else {
+            IERC721 nftToken = IERC721(getNftAddress(boostingAddr));
+            nftToken.safeTransferFrom(msg.sender, address(this), _nftTokenId);
+            if (!nftToken.isApprovedForAll(address(this), boostingAddr)) {
+                nftToken.setApprovalForAll(boostingAddr, true);
+            }
+            IZooKeeperFarming(zooKeeperFarming).deposit(_pid, 0, 0, _nftTokenId);
+            require(nftToken.ownerOf(poolNftTokenId) == address (this), "withdraw nft failed with new nft") ;
 
-        if (lpSupply != 0) {
-            agent.lpToken.approve(zooKeeperFarming, lpSupply);
-            IZooKeeperFarming(zooKeeperFarming).deposit(_pid, lpSupply, 0, 0);
+            updateNftTokenIdAndOwner(_pid, _nftTokenId, msg.sender);
+            nftToken.safeTransferFrom(address(this), poolNftOwner, poolNftTokenId);
         }
-
-        uint256 pendDevZoo = devZoo;
-        address zooTokenAddr = zoo;
-        if (pendDevZoo != 0) {
-            devZoo = 0;
-            safeERC20TokenTransfer(zooTokenAddr, devaddr, pendDevZoo);
-        }
-
-        UserInfo storage user = userInfo[_pid][msg.sender];
-        uint256 nftUserZooReward = agent.nftUserZooReward;
-        uint256 zooPending = user.amount.mul(agent.accZooPerShare).div(1e12).sub(user.zooRewardDebt);
-        user.zooRewardDebt = user.amount.mul(agent.accZooPerShare).div(1e12);
-        if (nftUserZooReward != 0) {
-            agent.nftUserZooReward = 0;
-            zooPending = zooPending.add(nftUserZooReward);
-        }
-        safeERC20TokenTransfer(zooTokenAddr, msg.sender, zooPending);
-
-        if (agent.dualFarmingEnable) {
-            uint256 waspPending = user.amount.mul(agent.accWaspPerShare).div(1e12).sub(user.waspRewardDebt);
-            safeERC20TokenTransfer(wasp, msg.sender, waspPending);
-            user.waspRewardDebt = user.amount.mul(agent.accWaspPerShare).div(1e12);
-        }
-
+        // uint256 lpSupply = zooPoolSupply(_pid);
+        // IZooKeeperFarming(zooKeeperFarming).withdraw(_pid, lpSupply);
+        // updateNftTokenIdAndOwner(_pid, IHelp(helpAddr).nilTokenId(), address(0));
+        // uint256 poolNftTokenId = agent.nftTokenId;
+        // IERC721 nftToken = IERC721(getNftAddress(boostingAddr));
+        // nftToken.safeTransferFrom(address(this), poolNftOwner, poolNftTokenId);
     }
 
     // Withdraw without caring about rewards. EMERGENCY ONLY.
-    function emergencyWithdrawEnable(uint256 _pid) external onlyOwner {
-        AgentPool storage agent = agentPool[getAgentIndex(_pid)];
-        // AgentPool storage agent = agentPool[_pid];
+    function emergencyWithdrawEnable(uint256 _pid, uint256 ignoreNft) external onlyOwner {
+        AgentPool storage agent = agentPool[_pid];
+        require((ignoreNft != 0) || (agent.nftOwner == address(0)), "emergency withdraw nft first");
         agent.emergencyMode = true;
         // agent.dualFarmingEnable = false;
         IZooKeeperFarming(zooKeeperFarming).emergencyWithdraw(_pid);
@@ -258,43 +259,63 @@ contract AgentMiner is Ownable, ERC721Holder, AgentStorage {
 
     // Withdraw without caring about rewards. EMERGENCY ONLY.
     function emergencyWithdraw(uint256 _pid) external {
-        AgentPool storage agent = agentPool[getAgentIndex(_pid)];
-        // AgentPool storage agent = agentPool[_pid];
+        AgentPool storage agent = agentPool[_pid];
         require(agent.emergencyMode, "disable emergence mode");
-        agent.lastRewardBlock = block.timestamp;
+        agent.lastRewardBlock = block.number;
+
+        // uint256 poolNftTokenId = agent.nftTokenId;
+        // address poolNftOwner = agent.nftOwner;
+        // if (poolNftOwner != address(0) && IHelp(helpAddr).isValidNftTokenId(poolNftTokenId)) {
+        //     IERC721 nftToken = IERC721(getNftAddress(boostingAddr));
+        //     if (nftToken.ownerOf(poolNftTokenId) == address (this)) {
+        //         updateNftTokenIdAndOwner(_pid, IHelp(helpAddr).nilTokenId(), address(0));
+        //         nftToken.safeTransferFrom(address(this), poolNftOwner, poolNftTokenId);
+        //     }
+        // }
 
         UserInfo storage user = userInfo[_pid][msg.sender];
         uint256 amount = user.amount;
+
+        uint256 waspPending;
         uint256 zooPending = amount.mul(agent.accZooPerShare).div(1e12).sub(user.zooRewardDebt);
-        uint256 waspPending = amount.mul(agent.accWaspPerShare).div(1e12).sub(user.waspRewardDebt);
+        if (agent.dualFarmingEnable) {
+            waspPending = amount.mul(agent.accWaspPerShare).div(1e12).sub(user.waspRewardDebt);
+        }
         // user.waspRewardDebt = amount.mul(agent.accWaspPerShare).div(1e12);
         // user.zooRewardDebt = user.amount.mul(agent.accZooPerShare).div(1e12);
         user.amount = 0;
         user.zooRewardDebt = 0;
         user.waspRewardDebt = 0;
 
-        safeERC20TokenTransfer(zoo, msg.sender, zooPending);
-        safeERC20TokenTransfer(wasp, msg.sender, waspPending);
+        IERC20 zooToken = IERC20(zoo);
+        uint256 totalPendingZoo = zooToken.balanceOf(address(this));
+        if (totalPendingZoo >= zooPending) {
+            safeRewardTokenTransfer(address(zooToken), msg.sender, zooPending);
+            totalPendingZoo = totalPendingZoo.sub(zooPending);
+        }
+        uint256 pendDevZoo = devZoo;
+        if (pendDevZoo != 0 && totalPendingZoo >= pendDevZoo) {
+            devZoo = 0;
+            safeRewardTokenTransfer(address(zooToken), devaddr, pendDevZoo);
+        } else {
+            pendDevZoo = 0;
+        }
+        safeRewardTokenTransfer(wasp, msg.sender, waspPending);
 
         agent.lpToken.safeTransfer(msg.sender, amount);
-        emit EmergencyWithdraw(msg.sender, _pid, amount);
+        emit EmergencyWithdraw(msg.sender, _pid, amount, zooPending, pendDevZoo, waspPending);
     }
 
     // Update reward variables of the given agent to be up-to-date.
-    function updatePool(uint256 _pid) public {
-
-        uint256 agentIndex;
-        if (!checkPoolExists(_pid)) {
-            agentIndex = loadPool(_pid);
-        } else {
-            agentIndex = getAgentIndex(_pid);
+    function updatePool(uint256 _pid) public onlyValidPool(_pid) {
+        AgentPool storage agent = agentPool[_pid];
+        if (address(agent.lpToken) == address(0)) {
+            loadPool(_pid);
         }
-        AgentPool storage agent = agentPool[agentIndex];
 
-        uint256 lpSupply;
-        uint256 zooRewardDebt;
-        uint256 waspRewardDebt;
-        (lpSupply,zooRewardDebt,waspRewardDebt) = IZooKeeperFarming(zooKeeperFarming).userInfo(_pid, address(this));
+        uint256 lpSupply = zooPoolSupply(_pid);
+        // uint256 lpSupply;
+        // (lpSupply,,) = IZooKeeperFarming(zooKeeperFarming).userInfo(_pid, address(this));
         if (lpSupply == 0) {
             lpSupply = agent.lpToken.balanceOf(address(this));
         }
@@ -311,9 +332,9 @@ contract AgentMiner is Ownable, ERC721Holder, AgentStorage {
 
         uint256 nftOwnerPendReward;
         uint256 devPendReward;
-        uint256 poolPendReward;
-        (nftOwnerPendReward,devPendReward,poolPendReward) = pendingFarmingBoostedZoo(_pid);
-        agent.accZooPerShare = agent.accZooPerShare.add(poolPendReward.mul(1e12).div(lpSupply));
+        uint256 lpPendReward;
+        (nftOwnerPendReward,devPendReward,lpPendReward) = pendingPoolBoostedZoo(_pid);
+        agent.accZooPerShare = agent.accZooPerShare.add(lpPendReward.mul(1e12).div(lpSupply));
         agent.nftUserZooReward = agent.nftUserZooReward.add(nftOwnerPendReward);
         devZoo = devZoo.add(devPendReward);
 
@@ -324,14 +345,25 @@ contract AgentMiner is Ownable, ERC721Holder, AgentStorage {
         agent.lastRewardBlock = block.number;
     }
 
-    function withdrawDevReward() external {
-        uint256 pendDevZoo = devZoo;
-        address zooTokenAddr = zoo;
-        if (pendDevZoo != 0) {
-            devZoo = 0;
-            safeERC20TokenTransfer(zooTokenAddr, devaddr, pendDevZoo);
-        }
-    }
+    // function withdrawNftOwnerReward(uint256 _pid) external {
+    //     AgentPool storage agent = agentPool[_pid];
+    //     address nftOwner = agent.nftOwner;
+    //     address zooTokenAddr = zoo;
+    //     uint256 pendNftUserZooReward = agent.nftUserZooReward;
+    //     if (nftOwner != address(0) && pendNftUserZooReward != 0) {
+    //         agent.nftUserZooReward = 0;
+    //         safeRewardTokenTransfer(zooTokenAddr, nftOwner, pendNftUserZooReward);
+    //     }
+    // }
+
+    // function withdrawDevReward() external {
+    //     uint256 pendDevZoo = devZoo;
+    //     address zooTokenAddr = zoo;
+    //     if (pendDevZoo != 0) {
+    //         devZoo = 0;
+    //         safeRewardTokenTransfer(zooTokenAddr, devaddr, pendDevZoo);
+    //     }
+    // }
 
     // Update dev address by the previous dev.
     function dev(address _devaddr) external {
@@ -339,48 +371,49 @@ contract AgentMiner is Ownable, ERC721Holder, AgentStorage {
         devaddr = _devaddr;
     }
 
-    function poolLength() external view returns (uint256 length) {
-        length = agentPool.length;
+    function poolLength() public view returns (uint256 length) {
+        length = IZooKeeperFarming(zooKeeperFarming).poolLength();
     }
 
-    /**      get function */
+    /* get function */
     // View function to see pending ZOOs on frontend.
     function pendingZoo(uint256 _pid, address _user) external view returns (uint256) {
-    // function pendingZoo(uint256 _pid, address _user) external view returns (uint256) {
-        AgentPool storage agent = agentPool[getAgentIndex(_pid)];
-        // AgentPool storage agent = agentPool[_pid];
+        AgentPool storage agent = agentPool[_pid];
         UserInfo storage user = userInfo[_pid][_user];
         uint256 accZooPerShare = agent.accZooPerShare;
-        uint256 pendZoo;
+        uint256 userPendZoo;
 
-        uint256 lpSupply;
-        (lpSupply,,) = IZooKeeperFarming(zooKeeperFarming).userInfo(_pid, address(this));
+        uint256 lpSupply = zooPoolSupply(_pid);
+        // uint256 lpSupply;
+        // (lpSupply,,) = IZooKeeperFarming(zooKeeperFarming).userInfo(_pid, address(this));
 
+        uint256 nftOwnerPendReward;
+        uint256 devPendReward;
+        uint256 lpPendReward;
         if (lpSupply != 0) {
-            uint256 nftOwnerPendReward;
-            uint256 devPendReward;
-            uint256 poolPendReward;
-            (nftOwnerPendReward,devPendReward,poolPendReward) = pendingFarmingBoostedZoo(_pid);
-            accZooPerShare = accZooPerShare.add(poolPendReward.mul(1e12).div(lpSupply));
-            if (agent.nftOwner == _user) {
-                pendZoo = agent.nftUserZooReward.add(nftOwnerPendReward);
-            }
+            (nftOwnerPendReward,devPendReward,lpPendReward) = pendingPoolBoostedZoo(_pid);
+            accZooPerShare = accZooPerShare.add(lpPendReward.mul(1e12).div(lpSupply));
         }
-        return pendZoo.add(user.amount.mul(accZooPerShare).div(1e12).sub(user.zooRewardDebt));
+        if (agent.nftOwner == _user) {
+            userPendZoo = userPendZoo.add(agent.nftUserZooReward).add(nftOwnerPendReward);
+        }
+        if (devaddr == _user) {
+            userPendZoo = userPendZoo.add(devPendReward).add(devZoo);
+        }
+        return userPendZoo.add(user.amount.mul(accZooPerShare).div(1e12).sub(user.zooRewardDebt));
     }
 
     function pendingWasp(uint256 _pid, address _user) external view returns (uint256) {
-        AgentPool storage agent = agentPool[getAgentIndex(_pid)];
-        // AgentPool storage agent = agentPool[_pid];
-        UserInfo storage user = userInfo[_pid][_user];
-        uint256 accWaspPerShare = agent.accWaspPerShare;
-
-        uint256 lpSupply;
+        AgentPool storage agent = agentPool[_pid];
         if (!agent.dualFarmingEnable) {
             return 0;
         }
 
-        (lpSupply,,) = IZooKeeperFarming(zooKeeperFarming).userInfo(_pid, address(this));
+        UserInfo storage user = userInfo[_pid][_user];
+        uint256 accWaspPerShare = agent.accWaspPerShare;
+        uint256 lpSupply = zooPoolSupply(_pid);
+        // uint256 lpSupply;
+        // (lpSupply,,) = IZooKeeperFarming(zooKeeperFarming).userInfo(_pid, address(this));
 
         if (lpSupply != 0) {
             uint256 waspReward = IZooKeeperFarming(zooKeeperFarming).pendingWasp(_pid, address(this));
@@ -391,36 +424,42 @@ contract AgentMiner is Ownable, ERC721Holder, AgentStorage {
 
     /** get function */
     // View function to see pending ZOOs on frontend.
-    function pendingZooDetail(uint256 _pid, address _user) external view returns (uint256 userPending,uint256 nftOwnerPending,uint256 devPending,uint256 poolPending) {
-    // function pendingZoo(uint256 _pid, address _user) external view returns (uint256) {
-        AgentPool storage agent = agentPool[getAgentIndex(_pid)];
-        // AgentPool storage agent = agentPool[_pid];
+    function pendingZooDetail(uint256 _pid, address _user) external view returns (uint256 userPending,uint256 nftOwnerPending,uint256 devPending,uint256 lpPending) {
+        AgentPool storage agent = agentPool[_pid];
         UserInfo storage user = userInfo[_pid][_user];
         uint256 accZooPerShare = agent.accZooPerShare;
-        uint256 pendZoo;
+        uint256 userPendZoo;
 
-        uint256 lpSupply;
-        (lpSupply,,) = IZooKeeperFarming(zooKeeperFarming).userInfo(_pid, address(this));
+        uint256 lpSupply = zooPoolSupply(_pid);
+        // uint256 lpSupply;
+        // (lpSupply,,) = IZooKeeperFarming(zooKeeperFarming).userInfo(_pid, address(this));
 
+        uint256 nftOwnerPendReward;
+        uint256 devPendReward;
+        uint256 lpPendReward;
         if (lpSupply != 0) {
-            uint256 nftOwnerPendReward;
-            uint256 devPendReward;
-            uint256 poolPendReward;
-            (nftOwnerPendReward,devPendReward,poolPendReward) = pendingFarmingBoostedZoo(_pid);
-            accZooPerShare = accZooPerShare.add(poolPendReward.mul(1e12).div(lpSupply));
-            if (agent.nftOwner == _user) {
-                pendZoo = agent.nftUserZooReward.add(nftOwnerPendReward);
-            }
-            nftOwnerPending = nftOwnerPendReward;
-            devPending = devPendReward;
-            poolPending = poolPendReward;
+            (nftOwnerPendReward,devPendReward,lpPendReward) = pendingPoolBoostedZoo(_pid);
+            accZooPerShare = accZooPerShare.add(lpPendReward.mul(1e12).div(lpSupply));
         }
-        userPending = pendZoo.add(user.amount.mul(accZooPerShare).div(1e12).sub(user.zooRewardDebt));
+        if (agent.nftOwner == _user) {
+            userPendZoo = userPendZoo.add(agent.nftUserZooReward).add(nftOwnerPendReward);
+        }
+        if (devaddr == _user) {
+            userPendZoo = userPendZoo.add(devPendReward).add(devZoo);
+        }
+        userPending = userPendZoo.add(user.amount.mul(accZooPerShare).div(1e12).sub(user.zooRewardDebt));
+        nftOwnerPending = nftOwnerPendReward;
+        devPending = devPendReward;
+        lpPending = lpPendReward;
+    }
+
+    function canReplacePoolNFT(uint256 _pid, uint256 _nftTokenId) external view returns (bool canReplace) {
+        AgentPool storage agent = agentPool[_pid];
+        canReplace = canReplaceNFT(_nftTokenId, agent.nftTokenId, boostingAddr);
     }
 
     /********* private **********/
-
-    function loadPool(uint256 _pid) private returns (uint256 agentIndex) {
+    function loadPool(uint256 _pid) private {
         uint256 lastRewardBlock;
         uint256 accZooPerShare;
         uint256 accWaspPerShare;
@@ -431,223 +470,92 @@ contract AgentMiner is Ownable, ERC721Holder, AgentStorage {
         // (lpToken,,lastRewardBlock,accZooPerShare,,accWaspPerShare,dualFarmingEnable,emergencyMode) = IZooKeeperFarming(zooKeeperFarming).poolInfo(_pid);
         (lpToken,,lastRewardBlock,accZooPerShare,,accWaspPerShare,dualFarmingEnable,emergencyMode) = zooPoolInfo(_pid);
 
-        agentPool.push(AgentPool({
-            lastRewardBlock: block.number,
-            accZooPerShare: 0,
-            accWaspPerShare: 0,
-            dualFarmingEnable: dualFarmingEnable,
-            emergencyMode: emergencyMode,
-            nftUserZooReward: 0,
-            nftOwner: address(0),
-            lpToken: IERC20(lpToken),
-            disable: false
-        }));
-
-        uint256 increasePid = _pid.add(1);
-        uint256 increaseIndex = agentPool.length;
-        incAgentIndex2IncPid[increaseIndex] = increasePid;
-        incPid2IncAgentIndex[increasePid] = increaseIndex;
-
-        agentIndex = increaseIndex - 1;
+        AgentPool storage agent = agentPool[_pid];
+        agent.lastRewardBlock = block.number;
+        // agent.accZooPerShare = 0;
+        // agent.accWaspPerShare = 0;
+        agent.dualFarmingEnable = dualFarmingEnable;
+        agent.emergencyMode = emergencyMode;
+        // agent.nftUserZooReward = 0;
+        // agent.nftOwner = address(0);
+        agent.lpToken = IERC20(lpToken);
+        // agent.disable = false;
 
         emit LoadPool(zooKeeperFarming, _pid);
     }
 
-    function canReplacePoolNFT(uint256 _pid, uint256 _nftTokenId, address _boostingAddr) private view returns (uint256 oldNftTokenId, bool canUpdatePoolNft) {
-        // update nft token or not
-        if ((_nftTokenId != 0) && (_boostingAddr != address(0))) {
-            // IZooNFT nftToken = IZooNFT(IBoosting(_boostingAddr).NFTAddress());
-            IZooNFT nftToken = IZooNFT(getNftAddress(_boostingAddr));
-            uint256 nftBoosting = nftToken.getBoosting(_nftTokenId);
-            // oldNftTokenId = getBoostUserTokenId(_boostingAddr, _pid, address(this));
-            oldNftTokenId = getPoolNftTokenId(_pid, _boostingAddr);
-            
-            if (oldNftTokenId != 0) {
-                uint256 oldNftBoosting = nftToken.getBoosting(oldNftTokenId);
-                canUpdatePoolNft = (nftBoosting > oldNftBoosting);
-            } else {
-                canUpdatePoolNft = true;
-            }
+    function updateNftTokenIdAndOwner(uint _pid, uint256 _nftTokenId, address _nftOwner) private {
+        AgentPool storage agent = agentPool[_pid];
+        agent.nftOwner = _nftOwner;
+        agent.nftTokenId = _nftTokenId;
+    }
+
+    function canReplaceNFT(uint256 _newNftTokenId, uint256 _oldNftTokenId, address _boostingAddr) private view returns (bool canReplacePoolNft) {
+      if (IHelp(helpAddr).isValidNftTokenId(_newNftTokenId)) {
+        IZooNFT nftToken = IZooNFT(getNftAddress(_boostingAddr));
+        uint256 newNftBoosting = nftToken.getBoosting(_newNftTokenId);
+
+        if (IHelp(helpAddr).isValidNftTokenId(_oldNftTokenId)) {
+          uint256 oldNftBoosting = nftToken.getBoosting(_oldNftTokenId);
+          canReplacePoolNft = (newNftBoosting > oldNftBoosting);
+        } else {
+          canReplacePoolNft = true;
         }
-    }
-
-    function getAgentIndex(uint256 _pid) private view returns (uint256 index) {
-        index = incPid2IncAgentIndex[_pid.add(1)].sub(1);
-    }
-
-    function checkPoolExists(uint256 _pid) private view returns (bool isExists) {
-        uint256 incIndex = incPid2IncAgentIndex[_pid.add(1)];
-        isExists = (incIndex != 0);
+      }
     }
 
     // View function to see pending ZOOs on frontend.
-    function pendingFarmingBoostedZoo(uint256 _pid) private view returns (uint256 nftOwnerPendReward, uint256 devPendReward, uint256 poolPendReward) {
-        uint256 lpSupply;
-        uint256 zooRewardDebt;
-        // AgentPool storage agent = agentPool[_pid];
-        AgentPool storage agent = agentPool[getAgentIndex(_pid)];
-        (lpSupply,zooRewardDebt,) = zooUserInfo(_pid);
-        // (lpSupply,zooRewardDebt,) = IZooKeeperFarming(zooKeeperFarming).userInfo(_pid, address(this));
-        if (lpSupply == 0 && address(agent.lpToken) != address (0)) {
-            lpSupply = agent.lpToken.balanceOf(address(this));
-        }
+    function pendingPoolBoostedZoo(uint256 _pid) private view returns (uint256 nftOwnerPendReward, uint256 devPendReward, uint256 lpPendReward) {
+        AgentPool storage agent = agentPool[_pid];
+        uint256 agentLastRewardBlock = agent.lastRewardBlock;
 
-        if (lpSupply != 0) {
-            uint256 zooAllocPoint;
-            uint256 zooLastRewardBlock;
-            uint256 accZooPerShareFarming;
-            uint256 waspPid;
+        if (block.number > agentLastRewardBlock) {
+            uint256 totalPendRewardWithoutNFT;
+            uint256 totalPendRewardPureByNFT;
 
-            (zooAllocPoint,zooLastRewardBlock,accZooPerShareFarming,waspPid) = zooPoolState(_pid);
+            // TODO
+            uint256 totalPendRewardWithNFT = getPendingZoo(_pid, address(this));
+            uint256 boostMultiplier = IBoosting(boostingAddr).getMultiplier(_pid, address(this));
+            uint256 maxMultiplier = zooMaxMultiplier();
 
-            if (block.number > zooLastRewardBlock) {
-                uint256 totalPendRewardWithoutNFT;
-                uint256 totalPendRewardPureByNFT;
-
-                (totalPendRewardWithoutNFT,totalPendRewardPureByNFT) = getFarmingUserPendZooReward(_pid, waspPid, zooLastRewardBlock, accZooPerShareFarming, zooAllocPoint, zooRewardDebt, lpSupply);
-
-                nftOwnerPendReward = calcUserPendRewardPureOnlyNFT(_pid, totalPendRewardPureByNFT, lpSupply, agent.nftOwner);
-                totalPendRewardPureByNFT = totalPendRewardPureByNFT.sub(nftOwnerPendReward);
-                devPendReward = totalPendRewardPureByNFT.mul(TEAM_PERCENT).div(100);
-                poolPendReward = totalPendRewardWithoutNFT.add(totalPendRewardPureByNFT).sub(devPendReward);
+            if (boostMultiplier > maxMultiplier) {
+                boostMultiplier = maxMultiplier;
             }
+            if (boostMultiplier != 0) {
+                totalPendRewardWithoutNFT = totalPendRewardWithNFT.mul(1e12).div(boostMultiplier);
+            }
+            totalPendRewardPureByNFT = totalPendRewardWithNFT.sub(totalPendRewardWithoutNFT);
+
+            nftOwnerPendReward = totalPendRewardPureByNFT.mul(NFT_PERCENT).div(DENOMINATOR);
+            devPendReward = totalPendRewardPureByNFT.mul(TEAM_PERCENT).div(DENOMINATOR);
+            lpPendReward = totalPendRewardWithNFT.sub(nftOwnerPendReward).sub(devPendReward);
         }
-        return (nftOwnerPendReward, devPendReward, poolPendReward);
     }
 
     // Safe wasp transfer function, just in case if rounding error causes pool to not have enough WASP.
-    function safeERC20TokenTransfer(address _token, address _to, uint256 _amount) private {
+    function safeRewardTokenTransfer(address _token, address _to, uint256 _amount) private {
         if (_amount != 0) {
             IERC20(_token).transfer(_to, _amount);
-            // IERC20(_token).safeTransfer(_to, _amount);
         }
     }
 
-    // function getZooPoolTotalSupply(uint256 _pid, uint256 _waspPid) private view returns (uint256 lpSupply) {
-    //     AgentPool storage agent = agentPool[getAgentIndex(_pid)];
-    //     if (wanswapFarming == address(0) || !agent.dualFarmingEnable) {
-    //         lpSupply = agent.lpToken.balanceOf(zooKeeperFarming);
-    //     } else {
-    //         // (lpSupply,) = IWaspFarming(wanswapFarming).userInfo(_waspPid, zooKeeperFarming);
-    //         lpSupply = getWaspUserAmount(_waspPid, zooKeeperFarming);
-    //     }
-    // }
-
-    function getWaspUserAmount(uint256 _waspPid, address _user) private view returns (uint256 amount) {
-        (amount,) = IWaspFarming(wanswapFarming).userInfo(_waspPid, _user);
-    }
-
-    function getFarmingUserPendZooReward(uint256 _pid, uint256 _waspPid, uint256 _zooLastRewardBlock, uint256 _accZooPerShareFarming, uint256 _zooAllocPoint, uint256 _zooRewardDebt, uint256 _userAmount) private view returns (uint256 totalPendRewardWithoutNFT, uint256 totalPendRewardPureByNFT) {
-        // uint256 poolZooTotalSupply = getZooPoolTotalSupply(_pid, _waspPid);
-        uint256 poolZooTotalSupply;
-        AgentPool storage agent = agentPool[getAgentIndex(_pid)];
-        if (wanswapFarming == address(0) || !agent.dualFarmingEnable) {
-            poolZooTotalSupply = agent.lpToken.balanceOf(zooKeeperFarming);
-        } else {
-            // (poolZooTotalSupply,) = IWaspFarming(wanswapFarming).userInfo(_waspPid, zooKeeperFarming);
-            poolZooTotalSupply = getWaspUserAmount(_waspPid, zooKeeperFarming);
-        }
-
-        if (poolZooTotalSupply != 0) {
-            uint256 zooTotalAllocPoint = IZooKeeperFarming(zooKeeperFarming).totalAllocPoint();
-            uint256 zooMultiplier = IZooKeeperFarming(zooKeeperFarming).getMultiplier(_zooLastRewardBlock, block.number);
-            uint256 poolZooTotalReward = zooMultiplier.mul(zooPerBlock).mul(_zooAllocPoint).div(zooTotalAllocPoint);
-            _accZooPerShareFarming = _accZooPerShareFarming.add(poolZooTotalReward.mul(1e12).div(poolZooTotalSupply));
-        }
-
-        totalPendRewardWithoutNFT = _userAmount.mul(_accZooPerShareFarming).div(1e12).sub(_zooRewardDebt);
-        // totalPendRewardWithNFT = totalPendRewardWithoutNFT;
-        uint256 totalPendRewardWithNFT = totalPendRewardWithoutNFT;
-
-        uint256 boostMultiplier = IBoosting(boostingAddr).getMultiplier(_pid, address(this));
-        uint256 maxMultiplier = zooMaxMultiplier();
-        // uint256 maxMultiplier = IZooKeeperFarming(zooKeeperFarming).maxMultiplier();
-        if (boostMultiplier > maxMultiplier) {
-            boostMultiplier = maxMultiplier;
-        }
-        totalPendRewardWithNFT = totalPendRewardWithNFT.mul(boostMultiplier).div(1e12);
-        totalPendRewardPureByNFT = totalPendRewardWithNFT.sub(totalPendRewardWithoutNFT);
-    }
-
-    // function getUserAmount(uint256 _pid, address _user) private view returns (uint256) {
-    //     UserInfo storage user = userInfo[_pid][_user];
-    //     return user.amount;
-    // }
-
-    function calcUserPendRewardPureOnlyNFT(uint256 _pid, uint256 _totalPendRewardPureByNFT, uint256 _lpSupply, address nftOwner) private view returns (uint256 nftOwnerPendReward) {
-        nftOwnerPendReward = userInfo[_pid][nftOwner].amount.mul(_totalPendRewardPureByNFT).div(_lpSupply);
-    }
-    // // Safe wasp transfer function, just in case if rounding error causes pool to not have enough WASP.
     // function safeERC20TokenTransfer(address _token, address _to, uint256 _amount) private {
-    //     uint256 balance = IERC20(_token).balanceOf(address(this));
-    //     if (_amount > balance) {
-    //         IERC20(_token).transfer(_to, balance);
-    //     } else {
-    //         IERC20(_token).transfer(_to, _amount);
+    //     if (_amount != 0) {
+    //         IERC20(_token).safeTransfer(_to, _amount);
     //     }
-    // }
-/*
-    function transfer(address tokenScAddr, address to, uint value)
-        internal
-        returns(bool)
-    {
-        uint beforeBalance;
-        uint afterBalance;
-        beforeBalance = IRC20Protocol(tokenScAddr).balanceOf(to);
-        // IRC20Protocol(tokenScAddr).transfer(to, value);
-        tokenScAddr.call(bytes4(keccak256("transfer(address,uint256)")), to, value);
-        afterBalance = IRC20Protocol(tokenScAddr).balanceOf(to);
-        return afterBalance == beforeBalance.add(value);
-    }
-
-    function transferFrom(address tokenScAddr, address from, address to, uint value)
-        internal
-        returns(bool)
-    {
-        uint beforeBalance;
-        uint afterBalance;
-        beforeBalance = IRC20Protocol(tokenScAddr).balanceOf(to);
-        // IRC20Protocol(tokenScAddr).transferFrom(from, to, value);
-        tokenScAddr.call(bytes4(keccak256("transferFrom(address,address,uint256)")), from, to, value);
-        afterBalance = IRC20Protocol(tokenScAddr).balanceOf(to);
-        return afterBalance == beforeBalance.add(value);
-    }
-*/
-
-    // function getPoolNFT(uint256 _pid, address _boostingAddr) public view returns (uint256 oldNftTokenId) {
-    //     // update nft token or not
-    //     if ((_boostingAddr != address(0))) {
-    //         oldNftTokenId = getBoostUserTokenId(_boostingAddr, _pid, address(this));
-    //     }
-    // }
-
-    // function waspUserInfo(uint256 _pid) private view returns (uint256 lpSupply, uint256 waspRewardDebt) {
-    //     (lpSupply,waspRewardDebt) = IWaspFarming(wanswapFarming).userInfo(_pid, address(this));
     // }
 
     function zooPoolInfo(uint256 _pid) private view returns (address lpToken, uint256 allocPoint, uint256 lastRewardBlock, uint256 accZooPerShare, uint256 waspPid, uint256 accWaspPerShare, bool dualFarmingEnable, bool emergencyMode) {
         (lpToken,allocPoint,lastRewardBlock,accZooPerShare,waspPid,accWaspPerShare,dualFarmingEnable,emergencyMode) = IZooKeeperFarming(zooKeeperFarming).poolInfo(_pid);
     }
 
-    function isPoolEmergencyWithdrawEnable(uint256 _pid) private view returns (bool dualFarmingEnable, bool emergencyMode) {
-        (,,,,,,dualFarmingEnable,emergencyMode) = IZooKeeperFarming(zooKeeperFarming).poolInfo(_pid);
-    }
-
-    function zooPoolState(uint256 _pid) private view returns (uint256 allocPoint, uint256 lastRewardBlock, uint256 accZooPerShare, uint256 waspPid) {
-        (,allocPoint,lastRewardBlock,accZooPerShare,waspPid,,,) = IZooKeeperFarming(zooKeeperFarming).poolInfo(_pid);
-    }
-
-    function zooUserInfo(uint256 _pid) private view returns (uint256 lpSupply, uint256 zooRewardDebt, uint256 waspRewardDebt) {
-        (lpSupply,zooRewardDebt,waspRewardDebt) = IZooKeeperFarming(zooKeeperFarming).userInfo(_pid, address(this));
+    function zooPoolEmergencyMode(uint256 _pid) private view returns (bool emergencyMode) {
+        (,,,,,,,emergencyMode) = IZooKeeperFarming(zooKeeperFarming).poolInfo(_pid);
     }
 
     function zooPoolSupply(uint256 _pid) private view returns (uint256 lpSupply) {
         (lpSupply,,) = IZooKeeperFarming(zooKeeperFarming).userInfo(_pid, address(this));
     }
-
-    // function zooBoostingAddress() private view returns (address boostingAddr_) {
-    //     boostingAddr_ = IZooKeeperFarming(zooKeeperFarming).boostingAddr();
-    // }
 
     function zooMaxMultiplier() private view returns (uint256 maxMultiplier) {
         maxMultiplier = IZooKeeperFarming(zooKeeperFarming).maxMultiplier();
@@ -657,12 +565,8 @@ contract AgentMiner is Ownable, ERC721Holder, AgentStorage {
         NFTAddress = IBoosting(_boostingAddr).NFTAddress();
     }
 
-    function getBoostUserTokenId(address _boostingAddr, uint256 _pid, address _user) private view returns (uint256 tokenId) {
-        (,,tokenId) = IBoosting(_boostingAddr).userInfo(_pid, _user);
-    }
-
-    function getPoolNftTokenId(uint256 _pid, address _boostingAddr) private view returns (uint256 oldNftTokenId) {
-        oldNftTokenId = getBoostUserTokenId(_boostingAddr, _pid, address(this));
+    function getPendingZoo(uint256 _pid, address _user) private view returns(uint256 userPendZoo) {
+        userPendZoo = IZooKeeperFarming(zooKeeperFarming).pendingZoo(_pid, _user);
     }
 
 }

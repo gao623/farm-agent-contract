@@ -14,7 +14,7 @@ interface IZooKeeperFarming {
 
     function poolInfo(uint256 pid) external view returns (address lpToken, uint256 allocPoint, uint256 lastRewardBlock, uint256 accZooPerShare, uint256 waspPid, uint256 accWaspPerShare, bool dualFarmingEnable, bool emergencyMode);
 
-    function poolLength(uint256 pid) external view returns (uint256);
+    function poolLength() external view returns (uint256);
 
     function userInfo(uint256 pid, address user) external view returns (uint256 amount, uint256 rewardDebt, uint256 waspRewardDebt);
 
